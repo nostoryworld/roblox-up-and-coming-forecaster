@@ -65,6 +65,8 @@ DRIFT_DAY = 2.0        # systematic downward drift, ranks per day (new games
 MIX_BASE = 0.20        # blend with the persistence forecast
 MIN_UNNAMED = 0.05     # leave at least this share unnamed per place
 CAND_DAYS = 3.0        # keep games seen in the last 3 days as candidates
+STALE_RANK_PENALTY = 8.0  # a game off the last chart is assumed to have
+                          # already slipped 8 ranks by the window's start
 HOURS = 72             # forecast window length
 
 
@@ -151,7 +153,7 @@ def main():
         else:
             if age_days > CAND_DAYS:
                 continue
-            r0 = last_rank + 8.0
+            r0 = last_rank + STALE_RANK_PENALTY
             stale = age_days
         # Velocity: least-squares slope of rank on days over the last day.
         recent = [(d, rk) for (d, rk) in pts if d >= -VEL_WINDOW_H / 24.0]
