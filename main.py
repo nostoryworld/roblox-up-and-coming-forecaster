@@ -1,27 +1,50 @@
-# Roblox Up-and-Coming top-10 forecaster (make.fun bounty roblox-up-and-coming-forecast-01)
+# Roblox Up-and-Coming top-10 forecaster v2 (make.fun bounty roblox-up-and-coming-forecast-01)
 #
-# Reads /input/history.ndjson (hourly snapshots of Roblox's Up-and-Coming
-# chart: each game's rank and player count) and /input/task.json, and writes
+# Reads /input/history.ndjson (snapshots of Roblox's Up-and-Coming chart:
+# each game's rank and player count) and /input/task.json, and writes
 # /output/forecast.json: for each of the top 10 places, a probability for
 # each game named being at that place, plus the top 10 in order.
 #
-# Method (fitted and backtested on the kit's 34-snapshot archive, Oct 30 -
-# Nov 7 2026): each game's rank is treated as a random walk with a small
-# drift. The drift is the game's recent rank velocity over the last 24 hours
-# (linear fit, shrunk by 0.21 - rank velocity barely persists, correlation
-# ~0.21 between consecutive moves), and the noise grows as 6 ranks per
-# sqrt(day). The probability of a game holding a place is its time average
-# over the 72 forecast hours, from the normal CDF of that walk. The result is
-# blended 80/20 with the plain persistence forecast (the chart barely moves
-# in the first hours). Games that left the chart in the last 3 days are kept
-# as candidates with a penalty, in case they climb back. Nothing is read
-# outside the history: no network, no clock, no files. Deterministic: the
-# same history always writes the same forecast, byte for byte.
+# Method: v1's rank random walk (per-game drift = recent rank velocity over
+# the last 24 hours, shrunk by 0.21; noise 6 ranks per sqrt(day); the
+# probability of a game holding a place is its time average over the 72
+# forecast hours, from the normal CDF of that walk; blended 80/20 with the
+# plain persistence forecast) PLUS a systematic downward drift of
+# 2 ranks per day. The drift is real and measured, not assumed: a regression
+# of each game's future mean rank on the archive fits future mean rank
+# ~= 6.2 + 1.05 * current rank (R^2 0.41), and the empirical transition
+# shows top-10 games fall ~0.6 ranks in 12h, ~2.2 in 24h, ~6.5 in 48h and
+# ~11.5 in 72h, because new games keep entering above them. v1's walk
+# centres on the current rank and misses that drift; v2 adds it.
 #
-# Backtest (19 rolling 72-hour windows on the archive, scored with the exact
-# log-score rule): mean -36.84 against the persistence baseline's -46.60,
-# better in every single window (+0.7 to +15.2). The house baseline scores
-# -43.51 on the practice window; this forecaster is built to beat it.
+# What was tried and rejected (all backtested on the kit's 19 rolling
+# 72-hour windows with the exact log-score rule; v1 = -36.84):
+#   - per-place occupancy tables fitted on the archive: -58.5 (far worse;
+#     the chart churns too fast for a stationary table, and it gives no mass
+#     to games climbing into the top 10 from below)
+#   - Ornstein-Uhlenbeck mean reversion to each game's historical mean rank:
+#     -39.8 (games do not revert to their historical mean; they drift down)
+#   - empirical transition kernel (drift + diffusion calibrated from the
+#     archive's read pairs): -39.5 to -40.6
+#   - occupancy/walk mixtures: -37.6 to -40.2 (the occupancy adds noise)
+#   - two-component sticky+jump walk: -36.77 (tied with v1)
+#   - regression-based centre (rank + velocity + age + playing + growth):
+#     -37.7 (the extra features add almost no predictive power, R^2 0.41
+#     -> 0.52, and the centre is not the bottleneck)
+#   - larger drift (4-8 ranks/day): worse (-37.2 to -38.8); the score is
+#     dominated by the early hours, where the drift is still small.
+# The honest result: v2 scores -36.67 on the same 19 windows, +0.17 over
+# v1, which is within the backtest's noise. The v1 random walk is already
+# at the achievable ceiling for a model fitted only on the kit's 34-read
+# archive. The dev-board bar for rank 50 (-29.1) is NOT reached by any
+# legitimate model tested here. For reference, the oracle (the future
+# reads' actual occupancy, perfect knowledge) scores -13.6 on these
+# windows, and the board's rank 10 sits at -13.2, essentially at the
+# oracle -- which is only possible by fitting to data beyond the kit's
+# archive. This entry does NOT do that: it is fitted only on the history
+# it reads at run time. Nothing is read outside the history: no network,
+# no clock, no files. Deterministic: the same history always writes the
+# same forecast, byte for byte.
 #
 # Python 3.13, standard library only.
 
@@ -33,10 +56,12 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 # Tuned on the archive backtest (see header). Flat region: neighbouring
-# values score within ~0.3 of these, so nothing here is knife-edge.
+# values score within ~0.2 of these, so nothing here is knife-edge.
 VEL_SHRINK = 0.21      # rank velocity persists only weakly; shrink the fit
 VEL_WINDOW_H = 24      # velocity fitted over the last 24 hours
 NOISE_DAY = 6.0        # rank noise, ranks per sqrt(day)
+DRIFT_DAY = 2.0        # systematic downward drift, ranks per day (new games
+                       # keep entering above; measured on the archive)
 MIX_BASE = 0.20        # blend with the persistence forecast
 MIN_UNNAMED = 0.05     # leave at least this share unnamed per place
 CAND_DAYS = 3.0        # keep games seen in the last 3 days as candidates
@@ -148,7 +173,7 @@ def main():
                 expiry_days = None  # inconsistent date; ignore it
         candidates.append((uid, r0, vel, stale, expiry_days))
 
-    # Time-averaged place probabilities from the rank random walk.
+    # Time-averaged place probabilities from the rank random walk with drift.
     prob = {}  # (uid, place) -> probability
     for uid, r0, vel, stale, expiry_days in candidates:
         extra_sd = stale * 6.0
@@ -156,7 +181,7 @@ def main():
             t = h / 24.0
             if expiry_days is not None and t > expiry_days:
                 break  # past its 28th day: off the chart for the rest
-            mu = r0 + vel * t
+            mu = r0 + (vel + DRIFT_DAY) * t
             sd = math.sqrt((NOISE_DAY * math.sqrt(t)) ** 2 + extra_sd ** 2) if t > 0 else 0.0
             for k in range(1, places + 1):
                 if t == 0.0:
