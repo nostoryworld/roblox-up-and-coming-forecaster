@@ -47,10 +47,14 @@
 # same forecast, byte for byte.
 #
 # Python 3.13, standard library only.
+#
+# Refactor note: the velocity fit, starting rank, 28-day expiry and
+# per-place capping are small helpers now; behavior is identical.
 
 import json
 import math
 import os
+from datetime import datetime, timedelta
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
@@ -82,6 +86,46 @@ def load_history(input_dir):
     return rows
 
 
+def fit_velocity(points, window_days):
+    """Least-squares slope of rank on days over the recent window."""
+    recent = [(d, rk) for (d, rk) in points if d >= -window_days]
+    if len(recent) < 2:
+        return 0.0
+    mx = sum(p[0] for p in recent) / len(recent)
+    my = sum(p[1] for p in recent) / len(recent)
+    den = sum((p[0] - mx) ** 2 for p in recent)
+    if den <= 0:
+        return 0.0
+    return sum((p[0] - mx) * (p[1] - my) for p in recent) / den
+
+
+def starting_rank(uid, last_rank, age_days, current_chart):
+    """Rank at the window start and how stale the game is, or None to skip."""
+    if uid in current_chart:
+        return current_chart[uid], 0.0
+    if age_days > CAND_DAYS:
+        return None
+    return last_rank + STALE_RANK_PENALTY, age_days
+
+
+def expiry_days_for(created, t_last):
+    """Days from the window start until a game's 28th day, or None."""
+    if created is None:
+        return None
+    days_left = (created + timedelta(days=28) - t_last).total_seconds() / 86400.0
+    if days_left <= 0:
+        return None
+    return days_left
+
+
+def cap_column(place_col, cap):
+    """Scale a place's probabilities so their total stays under the cap."""
+    total = sum(p for _, p in place_col)
+    if total <= cap:
+        return place_col
+    return [(uid, p * cap / total) for uid, p in place_col]
+
+
 def main():
     with open(os.path.join(INPUT_DIR, "task.json"), "r", encoding="utf-8") as f:
         task = json.load(f)
@@ -93,13 +137,11 @@ def main():
     last_time = last["at"]
 
     # Per-game rank series: (time_days_relative_to_last, rank), oldest first.
-    from datetime import datetime
-
     def parse_time(s):
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
     t_last = parse_time(last_time)
-    series = {}
+    rank_series = {}
     for r in rows:
         t = parse_time(r["at"])
         days = (t - t_last).total_seconds() / 86400.0
@@ -108,14 +150,14 @@ def main():
             rank = g.get("rank")
             if uid is None or rank is None:
                 continue
-            series.setdefault(uid, []).append((days, float(rank)))
+            rank_series.setdefault(uid, []).append((days, float(rank)))
 
-    last_chart = {}
+    current_chart = {}
     for g in last.get("up_and_coming") or []:
         uid = g.get("universe_id")
         rank = g.get("rank")
         if uid is not None and rank is not None:
-            last_chart[uid] = float(rank)
+            current_chart[uid] = float(rank)
 
     # Publish dates, when the history carries them: the house recorder's
     # rows include each game's details (created), the archive's do not.
@@ -143,40 +185,21 @@ def main():
 
     # Candidate games: the last chart, plus games seen in the last 3 days.
     candidates = []  # (uid, r0, velocity_ranks_per_day, stale_days, expiry_days)
-    for uid, pts in series.items():
+    for uid, pts in rank_series.items():
         pts.sort()
         last_days, last_rank = pts[-1]
         age_days = -last_days
-        if uid in last_chart:
-            r0 = last_chart[uid]
-            stale = 0.0
-        else:
-            if age_days > CAND_DAYS:
-                continue
-            r0 = last_rank + STALE_RANK_PENALTY
-            stale = age_days
+        start = starting_rank(uid, last_rank, age_days, current_chart)
+        if start is None:
+            continue
+        r0, stale = start
         # Velocity: least-squares slope of rank on days over the last day.
-        recent = [(d, rk) for (d, rk) in pts if d >= -VEL_WINDOW_H / 24.0]
-        vel = 0.0
-        if len(recent) >= 2:
-            mx = sum(p[0] for p in recent) / len(recent)
-            my = sum(p[1] for p in recent) / len(recent)
-            den = sum((p[0] - mx) ** 2 for p in recent)
-            if den > 0:
-                vel = sum((p[0] - mx) * (p[1] - my) for p in recent) / den
-        vel *= VEL_SHRINK
-        expiry_days = None
-        created = created_by_uid.get(uid)
-        if created is not None:
-            from datetime import timedelta
-
-            expiry_days = (created + timedelta(days=28) - t_last).total_seconds() / 86400.0
-            if expiry_days <= 0:
-                expiry_days = None  # inconsistent date; ignore it
+        vel = fit_velocity(pts, VEL_WINDOW_H / 24.0) * VEL_SHRINK
+        expiry_days = expiry_days_for(created_by_uid.get(uid), t_last)
         candidates.append((uid, r0, vel, stale, expiry_days))
 
     # Time-averaged place probabilities from the rank random walk with drift.
-    prob = {}  # (uid, place) -> probability
+    walk_prob = {}  # (uid, place) -> probability
     for uid, r0, vel, stale, expiry_days in candidates:
         extra_sd = stale * 6.0
         for h in range(HOURS):
@@ -192,51 +215,48 @@ def main():
                     p = phi((k + 0.5 - mu) / sd) - phi((k - 0.5 - mu) / sd)
                 if p > 0:
                     key = (uid, k)
-                    prob[key] = prob.get(key, 0.0) + p / HOURS
+                    walk_prob[key] = walk_prob.get(key, 0.0) + p / HOURS
 
     # Persistence forecast, for the blend: the chart as it stands.
-    chart_now = sorted(last_chart.items(), key=lambda kv: kv[1])
+    chart_now = sorted(current_chart.items(), key=lambda kv: kv[1])
     ordered = [uid for uid, _ in chart_now]
-    base = {}  # (uid, place) -> probability
+    persistence = {}  # (uid, place) -> probability
     for place in range(1, places + 1):
         if place - 1 < len(ordered):
-            base[(ordered[place - 1], place)] = 0.5
+            persistence[(ordered[place - 1], place)] = 0.5
         if place == 1:
             if len(ordered) > 1:
-                base[(ordered[1], place)] = 0.3
+                persistence[(ordered[1], place)] = 0.3
         else:
             if place - 2 >= 0:
-                base[(ordered[place - 2], place)] = 0.15
+                persistence[(ordered[place - 2], place)] = 0.15
             if place < len(ordered):
-                base[(ordered[place], place)] = 0.15
+                persistence[(ordered[place], place)] = 0.15
 
     # Blend, then cap each place's named total so an unnamed share remains
     # for games that join the chart during the window.
-    merged = {}
-    for key, p in prob.items():
-        merged[key] = merged.get(key, 0.0) + (1.0 - MIX_BASE) * p
-    for key, p in base.items():
-        merged[key] = merged.get(key, 0.0) + MIX_BASE * p
+    blended_prob = {}
+    for key, p in walk_prob.items():
+        blended_prob[key] = blended_prob.get(key, 0.0) + (1.0 - MIX_BASE) * p
+    for key, p in persistence.items():
+        blended_prob[key] = blended_prob.get(key, 0.0) + MIX_BASE * p
 
     probabilities = []
     for place in range(1, places + 1):
-        col = sorted(
-            ((uid, p) for (uid, pl), p in merged.items() if pl == place),
+        place_col = sorted(
+            ((uid, p) for (uid, pl), p in blended_prob.items() if pl == place),
             key=lambda kv: -kv[1],
         )
-        total = sum(p for _, p in col)
-        cap = 1.0 - MIN_UNNAMED
-        if total > cap:
-            col = [(uid, p * cap / total) for uid, p in col]
-        for uid, p in col[:100]:
+        place_col = cap_column(place_col, 1.0 - MIN_UNNAMED)
+        for uid, p in place_col[:100]:
             if p > 0.0005:
                 probabilities.append({"universe_id": uid, "place": place, "p": round(p, 6)})
 
     # Top 10 by expected place (lowest first), tie-break by current rank.
     expected = {}
-    for (uid, k), p in prob.items():
+    for (uid, k), p in walk_prob.items():
         expected[uid] = expected.get(uid, 0.0) + k * p
-    top10 = sorted(expected, key=lambda u: (expected[u], last_chart.get(u, 999)))[:places]
+    top10 = sorted(expected, key=lambda u: (expected[u], current_chart.get(u, 999)))[:places]
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with open(os.path.join(OUTPUT_DIR, output_name), "w", encoding="utf-8") as f:
